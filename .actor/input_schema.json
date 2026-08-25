@@ -1,0 +1,203 @@
+{
+  "title": "IT Company Finder (standalone)",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "editor": "textfield",
+      "description": "City or area to search, e.g. \"Kolkata, India\" or \"Salt Lake Sector V, Kolkata\".",
+      "prefill": "Kolkata, India"
+    },
+    "areas": {
+      "title": "Areas to sweep",
+      "type": "array",
+      "editor": "stringList",
+      "description": "Run every search term separately against each area. This is the single most important setting for coverage: Google's local finder caps out near 100 results per query, so sweeping sub-areas is the only way past that ceiling. Leave empty to use either the single Location above or the built-in area list."
+    },
+    "useBuiltInAreas": {
+      "title": "Use built-in Kolkata area list",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": false,
+      "description": "Sweeps 46 built-in Kolkata/Howrah localities instead of one city-wide query. Needed for full coverage, but multiplies SERP usage by 46 - check the budget maths in the README first."
+    },
+    "categories": {
+      "title": "Sectors to include",
+      "type": "array",
+      "editor": "select",
+      "items": {
+        "type": "string",
+        "enum": [
+          "software",
+          "web_mobile",
+          "digital_marketing",
+          "data_ai",
+          "cybersecurity",
+          "erp_crm",
+          "game_dev",
+          "it_services"
+        ],
+        "enumTitles": [
+          "Software / product engineering",
+          "Web & mobile development",
+          "Digital marketing / SEO",
+          "Data / AI / analytics",
+          "Cybersecurity",
+          "ERP / CRM implementation",
+          "Game development / animation",
+          "IT services / consulting"
+        ]
+      },
+      "description": "Which sectors to search for and keep. Defaults to the five commercial-agency sectors. Data/AI, cybersecurity and game development are available but off by default; note that a software firm which merely mentions AI is still kept as software - only pure plays in an unselected sector are dropped.",
+      "prefill": [
+        "software",
+        "web_mobile",
+        "digital_marketing",
+        "erp_crm",
+        "it_services"
+      ],
+      "default": [
+        "software",
+        "web_mobile",
+        "digital_marketing",
+        "erp_crm",
+        "it_services"
+      ]
+    },
+    "searchTerms": {
+      "title": "Search terms",
+      "type": "array",
+      "editor": "stringList",
+      "description": "Optional override. Leave empty to use the phrase set for your selected sectors, which is usually better."
+    },
+    "countryCode": {
+      "title": "Country",
+      "type": "string",
+      "editor": "select",
+      "default": "IN",
+      "enum": [
+        "IN",
+        "US",
+        "GB",
+        "AU",
+        "CA",
+        "DE",
+        "SG",
+        "AE"
+      ],
+      "enumTitles": [
+        "India",
+        "United States",
+        "United Kingdom",
+        "Australia",
+        "Canada",
+        "Germany",
+        "Singapore",
+        "UAE"
+      ],
+      "description": "Selects both the Google domain and the proxy exit country. Must match your target market or results come back for the wrong locale."
+    },
+    "maxCompanies": {
+      "title": "Max companies",
+      "type": "integer",
+      "editor": "number",
+      "default": 0,
+      "description": "Stop after this many unique companies. Set 0 for no limit (needed if you want everything)."
+    },
+    "maxLocalPagesPerTerm": {
+      "title": "Local finder pages per term",
+      "type": "integer",
+      "editor": "number",
+      "default": 3,
+      "description": "Each page yields roughly 20 businesses and costs one SERP request. 3 pages x 5 terms = 15 SERP requests for discovery."
+    },
+    "serpBudget": {
+      "title": "SERP request budget",
+      "type": "integer",
+      "editor": "number",
+      "default": 2000,
+      "description": "Hard cap on Google requests for this run, so you cannot accidentally drain the monthly SERP allowance (10,000 on the Creator plan). Set 0 for no cap."
+    },
+    "itFilter": {
+      "title": "Apply sector filter",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": true,
+      "description": "Drops training institutes, recruitment agencies, repair shops and retailers, which Google's local finder mixes into these queries heavily. Rejections are tallied by reason in the run log."
+    },
+    "requireWebsite": {
+      "title": "Only keep companies with a website",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": false,
+      "description": "No website means weaker founder, employee and type data. Turn on for a fully-enriched list."
+    },
+    "minRating": {
+      "title": "Minimum Google rating",
+      "type": "number",
+      "editor": "number",
+      "description": "Optional, e.g. 4.5. Leave empty to keep all. Note: unrated new companies are dropped when this is set."
+    },
+    "minReviews": {
+      "title": "Minimum number of reviews",
+      "type": "integer",
+      "editor": "number",
+      "default": 0,
+      "description": "Optional. Filters out listings with little review history."
+    },
+    "enrichFromWebsite": {
+      "title": "Crawl company websites",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": true,
+      "description": "Reads each company's own site for founder, team size and service/product signals. Costs no SERP requests - this is direct HTTP."
+    },
+    "enrichFounderFromSerp": {
+      "title": "Look up founder via Google",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": true,
+      "description": "One SERP request per company, used only when the company's own website did not state a founder."
+    },
+    "enrichEmployeesFromSerp": {
+      "title": "Look up employee count via Google",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": true,
+      "description": "One SERP request per company. Reads the employee count out of the LinkedIn company page's Google snippet - it never fetches or logs into LinkedIn."
+    },
+    "maxPagesPerSite": {
+      "title": "Max pages per website",
+      "type": "integer",
+      "editor": "number",
+      "default": 5,
+      "description": "Homepage plus this many About/Team/Services pages. Higher means better founder detection but slower runs."
+    },
+    "concurrency": {
+      "title": "Concurrent website reads",
+      "type": "integer",
+      "editor": "number",
+      "default": 8,
+      "description": "How many company websites to crawl at once. Does not affect SERP requests, which are always sequential and rate-limited."
+    },
+    "requestTimeoutSecs": {
+      "title": "Per-request timeout (seconds)",
+      "type": "integer",
+      "editor": "number",
+      "default": 20,
+      "description": "How long to wait for each request before giving up."
+    },
+    "debugDumpHtml": {
+      "title": "Save raw Google HTML for debugging",
+      "type": "boolean",
+      "editor": "checkbox",
+      "default": false,
+      "description": "Saves the first local-results page per search term to the key-value store. Turn this on if results go empty - Google rotates its CSS class names, and the saved HTML is what you need to fix the selectors."
+    }
+  },
+  "required": [
+    "location"
+  ]
+}
