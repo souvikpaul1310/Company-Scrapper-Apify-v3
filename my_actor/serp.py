@@ -51,8 +51,36 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
-CONSENT_MARKERS = ("consent.google", "Before you continue", "id=\"CXQnmb\"")
-BLOCK_MARKERS = ("Our systems have detected unusual traffic", "/sorry/index", "captcha")
+CONSENT_MARKERS = ("consent.google", "Before you continue", 'id="CXQnmb"')
+
+# Block detection must be precise. An earlier version tested for the bare
+# substring "captcha", which matches "recaptcha" in the gstatic script tag
+# present on ordinary Google result pages -- so every successful fetch was
+# misreported as blocked. Match only markers that cannot appear on a good page.
+BLOCK_MARKERS = (
+    "Our systems have detected unusual traffic",
+    "detected unusual traffic from your computer network",
+    "/sorry/index",
+    'id="captcha-form"',
+    "why did this happen",
+    "unusual traffic from your computer",
+)
+# A "sorry" interstitial also identifies itself in the title.
+BLOCK_TITLE = re.compile(r"<title[^>]*>\s*(?:Error\s*)?(?:302\s*)?(?:Moved|Sorry)", re.I)
+
+
+def _is_blocked(body: str, status: int) -> str:
+    """Return a reason string if this response is a block page, else ''."""
+    if status == 429:
+        return "http 429"
+    if status == 503:
+        return "http 503"
+    for marker in BLOCK_MARKERS:
+        if marker in body:
+            return f"marker: {marker[:40]}"
+    if BLOCK_TITLE.search(body[:2000]):
+        return "sorry/redirect title"
+    return ""
 
 
 @dataclass
@@ -112,6 +140,10 @@ class SerpClient:
         self.stats = SerpStats(budget=budget)
         self._store = store
         self._session: aiohttp.ClientSession | None = None
+        self._dumped_block = False
+        self._dumped_error = False
+        self._lcl_failures = 0
+        self._lcl_disabled = False
 
         # Google SERP proxy username carries the params; there is no session
         # parameter for this group.
@@ -153,15 +185,36 @@ class SerpClient:
                 ) as resp:
                     body = await resp.text(errors="ignore")
 
-                    if resp.status == 429 or any(m in body for m in BLOCK_MARKERS):
+                    reason = _is_blocked(body, resp.status)
+                    if reason:
                         self.stats.blocked += 1
-                        logger.warning("SERP blocked (attempt %s) for %s", attempt, label or url)
+                        logger.warning(
+                            "SERP blocked (attempt %s, %s, %s bytes) for %s",
+                            attempt, reason, len(body), label or url,
+                        )
+                        # Snapshot the first block so the cause is inspectable
+                        # rather than guessed at. Without this, a block page and
+                        # a markup change look identical from the log.
+                        if not self._dumped_block:
+                            self._dumped_block = True
+                            await self.dump_html("BLOCKED-response.html", body)
+                            logger.warning(
+                                "Saved the blocked response to the key-value store as "
+                                "BLOCKED-response.html - open it to see what Google returned."
+                            )
                         await asyncio.sleep(3 * attempt)
                         continue
+
                     if resp.status >= 400:
-                        logger.warning("SERP HTTP %s for %s", resp.status, label or url)
+                        logger.warning(
+                            "SERP HTTP %s (%s bytes) for %s", resp.status, len(body), label or url
+                        )
+                        if not self._dumped_error:
+                            self._dumped_error = True
+                            await self.dump_html(f"HTTP{resp.status}-response.html", body)
                         await asyncio.sleep(2 * attempt)
                         continue
+
                     if any(m in body for m in CONSENT_MARKERS):
                         # Consent interstitial: retry usually lands on a
                         # different IP that doesn't require it.
@@ -169,6 +222,7 @@ class SerpClient:
                         await asyncio.sleep(2)
                         continue
 
+                    logger.debug("SERP ok (%s bytes) for %s", len(body), label or url)
                     return body
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -190,22 +244,51 @@ class SerpClient:
 
     # ------------------------------------------------------------ local finder
 
-    async def local_search(self, query: str, *, start: int = 0) -> tuple[list[LocalResult], str]:
-        """Google local finder page. Returns (results, raw_html).
+    async def local_search(
+        self, query: str, *, start: int = 0, allow_lcl: bool = True
+    ) -> tuple[list[LocalResult], str]:
+        """Businesses for a query, with automatic fallback.
 
-        `tbm=lcl` is the "Places"/local tab. It returns roughly 20 businesses
-        per page with rating and review count inline, and paginates by 20 via
-        the `start` parameter -- far denser than the 3-result local pack on a
-        normal search page.
+        Preferred path is `tbm=lcl` (Google's local-finder tab): ~20 businesses
+        per page with rating and review count inline, paginated by 20.
+
+        Caveat: Apify's GOOGLE_SERP proxy documents support for Google Search
+        and Google Shopping only. `tbm=lcl` is still a `/search` URL so it may
+        pass, but it is not guaranteed. When it comes back blocked or empty we
+        fall back to a plain `/search`, which is explicitly supported, and
+        parse the local pack out of it. The pack holds ~3 businesses instead of
+        20, so coverage per request is lower -- but it works.
         """
+        if allow_lcl and not self._lcl_disabled:
+            url = (
+                f"http://{self.domain}/search?q={quote_plus(query)}"
+                f"&tbm=lcl&hl=en&gl={self.country.lower()}&start={start}"
+            )
+            html = await self._get(url, label=f"lcl:{query}@{start}")
+            if html:
+                rows = parse_local_results(html)
+                if rows:
+                    return rows, html
+                logger.info("tbm=lcl returned no parseable rows for %r", query)
+            self._lcl_failures += 1
+            if self._lcl_failures >= 3:
+                self._lcl_disabled = True
+                logger.warning(
+                    "tbm=lcl failed %s times; falling back to plain search for the rest "
+                    "of this run. Apify's GOOGLE_SERP proxy only documents support for "
+                    "Google Search and Shopping, so the local-finder tab may be refused.",
+                    self._lcl_failures,
+                )
+
+        # Fallback: plain search. Pagination by 10 here, not 20.
         url = (
             f"http://{self.domain}/search?q={quote_plus(query)}"
-            f"&tbm=lcl&hl=en&gl={self.country.lower()}&start={start}"
+            f"&hl=en&gl={self.country.lower()}&start={start // 2}"
         )
-        html = await self._get(url, label=f"lcl:{query}@{start}")
+        html = await self._get(url, label=f"plain:{query}@{start}")
         if not html:
             return [], ""
-        return parse_local_results(html), html
+        return parse_local_pack(html), html
 
     async def organic_search(self, query: str, *, num: int = 10) -> tuple[list[OrganicResult], str]:
         url = (
@@ -427,3 +510,94 @@ def parse_organic_results(html: str) -> list[OrganicResult]:
         out.append(OrganicResult(title=title, url=url, snippet=snippet))
 
     return out
+
+
+def parse_local_pack(html: str) -> list[LocalResult]:
+    """Extract the local pack from a *plain* Google search page.
+
+    A normal results page shows a small map block with roughly three
+    businesses. Far less dense than tbm=lcl, but plain `/search` is the
+    endpoint Apify's GOOGLE_SERP proxy officially supports, so this is the
+    reliable fallback.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    results: list[LocalResult] = []
+    seen: set[str] = set()
+
+    # The pack lives in a handful of containers depending on layout.
+    blocks = soup.select(
+        "div.VkpGBb, div.rllt__details, div.cXedhc, div.uMdZh, "
+        "div[data-record-index], div.C8TUKc"
+    )
+    if not blocks:
+        # Some layouts only expose headings; climb to a sensible ancestor.
+        for t in soup.select("div.dbg0pd, span.OSrXXb"):
+            anc = t.find_parent("div")
+            if anc is not None and anc.find_parent("div") is not None:
+                blocks.append(anc.find_parent("div"))
+
+    for block in blocks:
+        text = block.get_text(" ", strip=True)
+        if not text or len(text) < 6:
+            continue
+
+        name_el = block.select_one("div.dbg0pd, span.OSrXXb, div.qBF1Pd, span.DkEaL, h3")
+        name = name_el.get_text(" ", strip=True) if name_el else text.split("·")[0].strip()
+        name = re.sub(r"^\d+\.\s*", "", name).strip()[:120]
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+
+        item = LocalResult(name=name)
+
+        aria = " ".join(
+            el.get("aria-label", "")
+            for el in block.select("[aria-label]")
+            if "star" in el.get("aria-label", "").lower()
+            or "review" in el.get("aria-label", "").lower()
+        )
+        probe = aria if aria else text
+        m = RATING_REVIEWS.search(probe)
+        if m:
+            item.rating = _to_float(m.group(1))
+            item.reviews = _to_int(m.group(2))
+        else:
+            rm = RATING_ONLY.search(probe)
+            if rm:
+                item.rating = _to_float(rm.group(1))
+            vm = REVIEWS_ONLY.search(probe)
+            if vm:
+                item.reviews = _to_int(vm.group(1))
+        if item.rating is not None and not (0.0 < item.rating <= 5.0):
+            item.rating = None
+
+        parts = [p.strip() for p in re.split(r"\u00b7|\|", text) if p.strip()]
+        name_low = name.lower()
+        for part in parts:
+            if part.lower().startswith(name_low):
+                part = part[len(name):].strip(" ,-–—·|")
+                if not part:
+                    continue
+            low = part.lower()
+            if low == name_low:
+                continue
+            if re.search(r"\d", part) and any(
+                tok in low for tok in ("road", "rd", "street", "block", "sector", "floor",
+                                       "tower", "lane", "nagar", "park", "kolkata", "howrah", "7000")
+            ):
+                cand = _trim_address(part)
+                if len(cand) > len(item.address):
+                    item.address = cand
+            elif not item.category and re.fullmatch(r"[A-Za-z /&'-]{3,40}", part):
+                if not RATING_ONLY.search(part) and "review" not in low:
+                    item.category = part
+
+        for a in block.select("a[href]"):
+            u = _clean_url(a.get("href", ""))
+            if u:
+                item.website = u
+                break
+
+        results.append(item)
+
+    return results
