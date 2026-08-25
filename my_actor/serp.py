@@ -51,22 +51,32 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
-CONSENT_MARKERS = ("consent.google", "Before you continue", 'id="CXQnmb"')
+CONSENT_MARKERS = ('id="CXQnmb"', "Before you continue to Google")
 
-# Block detection must be precise. An earlier version tested for the bare
-# substring "captcha", which matches "recaptcha" in the gstatic script tag
-# present on ordinary Google result pages -- so every successful fetch was
-# misreported as blocked. Match only markers that cannot appear on a good page.
+# Block detection is the single most dangerous thing in this file to get wrong,
+# because a false positive makes a working scraper look permanently broken.
+#
+# Two markers already burned this actor:
+#   * "captcha"      matches "recaptcha" in the gstatic script tag on EVERY
+#                    ordinary results page.
+#   * "/sorry/index" appears inside Google's inline error-handling JavaScript
+#                    on ordinary results pages too.
+#
+# The lesson: never substring-scan a full 390 KB results page for short
+# markers. Real block pages are *small* and say so in the title, so gate on
+# size and search only the head of the document.
 BLOCK_MARKERS = (
     "Our systems have detected unusual traffic",
     "detected unusual traffic from your computer network",
-    "/sorry/index",
-    'id="captcha-form"',
-    "why did this happen",
     "unusual traffic from your computer",
+    'id="captcha-form"',
 )
-# A "sorry" interstitial also identifies itself in the title.
-BLOCK_TITLE = re.compile(r"<title[^>]*>\s*(?:Error\s*)?(?:302\s*)?(?:Moved|Sorry)", re.I)
+# A real interstitial announces itself in the title.
+BLOCK_TITLE = re.compile(r"<title[^>]*>\s*(?:Sorry|Error|Moved|302)", re.I)
+
+# Anything this big is a rendered results page, not an interstitial. Google's
+# "sorry" pages are a few KB; a results page is 200 KB+.
+BLOCK_SIZE_CEILING = 60_000
 
 
 def _is_blocked(body: str, status: int) -> str:
@@ -75,11 +85,21 @@ def _is_blocked(body: str, status: int) -> str:
         return "http 429"
     if status == 503:
         return "http 503"
+
+    # Explicit unusual-traffic language is trustworthy at any size.
+    head = body[:20_000]
     for marker in BLOCK_MARKERS:
-        if marker in body:
+        if marker in head:
             return f"marker: {marker[:40]}"
+
+    # Past this size it is a real page; do not second-guess it.
+    if len(body) >= BLOCK_SIZE_CEILING:
+        return ""
+
     if BLOCK_TITLE.search(body[:2000]):
         return "sorry/redirect title"
+    if "/sorry/index" in head:
+        return "sorry redirect (small page)"
     return ""
 
 
@@ -303,14 +323,86 @@ class SerpClient:
 
 # ------------------------------------------------------------------ parsers
 
-# "4.5(128)" / "4.5 (128)" / "4,5 · 128 reviews"
-RATING_REVIEWS = re.compile(
-    r"(\d[.,]\d)\s*(?:\u00b7|\||\s)?\s*\(?\s*([\d,\.]+)\s*\)?\s*(?:reviews?|ratings?)?",
+# Google's own accessibility label is by far the most stable source for these
+# two fields, and it is the only place the review count survives unrounded
+# formatting. Confirmed shape against live HTML:
+#   "Rated 4.2 out of 5, 2.7K user reviews"
+ARIA_RATING = re.compile(
+    r"Rated\s+([\d.,]+)\s+out of\s+\d+\s*,?\s*([\d.,]+\s*[KMkm]?)\s*(?:user\s+)?(?:reviews?|ratings?)",
     re.I,
 )
-REVIEWS_ONLY = re.compile(r"([\d,\.]+)\s*(?:reviews?|ratings?)", re.I)
+# Fallback for visible text: "4.5(128)" / "4.5 (2.7K)"
+RATING_REVIEWS = re.compile(
+    r"(\d[.,]\d)\s*(?:\u00b7|\||\s)?\s*\(\s*([\d,\.]+\s*[KMkm]?)\s*\)",
+    re.I,
+)
+REVIEWS_ONLY = re.compile(r"([\d,\.]+\s*[KMkm]?)\s*(?:user\s+)?(?:reviews?|ratings?)", re.I)
 RATING_ONLY = re.compile(r"\b([1-5][.,]\d)\b")
 PHONE_RE = re.compile(r"(?:\+91[\s-]?)?(?:\d[\s-]?){9,13}")
+
+# Service attributes Google lists alongside the category; never a category.
+SERVICE_ATTRS = re.compile(
+    r"^(?:on-?site services?|online appointments?|onsite services?|"
+    r"open 24 hours|open|closed|closes soon|identifies as[\w\s-]*|"
+    r"\d+\+? years in business)$",
+    re.I,
+)
+
+
+def _to_count(raw: str) -> int | None:
+    """Parse a review count, expanding Google's K/M abbreviations.
+
+    "2.7K" -> 2700. Google rounds these itself, so the result is approximate
+    for large counts; that is Google's precision, not ours to invent.
+    """
+    if not raw:
+        return None
+    s = raw.strip().replace(",", "")
+    mult = 1
+    if s and s[-1] in "KkMm":
+        mult = 1_000 if s[-1] in "Kk" else 1_000_000
+        s = s[:-1].strip()
+    try:
+        return int(round(float(s) * mult))
+    except ValueError:
+        return None
+
+
+def _rating_and_reviews(block, text: str) -> tuple[float | None, int | None]:
+    """Pull (rating, reviews) from a result block, aria-label first."""
+    for el in block.select("[aria-label]"):
+        m = ARIA_RATING.search(el.get("aria-label", ""))
+        if m:
+            try:
+                rating = float(m.group(1).replace(",", "."))
+            except ValueError:
+                rating = None
+            if rating is not None and not (0.0 < rating <= 5.0):
+                rating = None
+            return rating, _to_count(m.group(2))
+
+    rating = reviews = None
+    m = RATING_REVIEWS.search(text)
+    if m:
+        try:
+            rating = float(m.group(1).replace(",", "."))
+        except ValueError:
+            rating = None
+        reviews = _to_count(m.group(2))
+    else:
+        rm = RATING_ONLY.search(text)
+        if rm:
+            try:
+                rating = float(rm.group(1).replace(",", "."))
+            except ValueError:
+                rating = None
+        vm = REVIEWS_ONLY.search(text)
+        if vm:
+            reviews = _to_count(vm.group(1))
+
+    if rating is not None and not (0.0 < rating <= 5.0):
+        rating = None
+    return rating, reviews
 
 
 def _to_int(raw: str) -> int | None:
@@ -331,6 +423,61 @@ TRAILING_JUNK = re.compile(
     r"reserve a table|open now|closed|opens|closes|share|save)\b.*$",
     re.I,
 )
+
+
+ADDRESS_TOKENS = (
+    "road", "rd", "street", "st ", "block", "sector", "floor", "tower", "lane",
+    "nagar", "park", "kolkata", "howrah", "7000", "complex", "building", "unit",
+    "suite", "room", "plot", "bypass", "avenue", "bagan", "pally", "colony",
+    "market", "station", "cn-", "dn-", "ep ", "gp ", "bn-", "no.",
+)
+
+
+# Google renders the category and the address in sibling divs, so they arrive
+# glued into one "·" segment: "Software company CN-8/2". Split on the noun the
+# category ends with -- splitting at the first digit instead mangles addresses
+# that begin with a word ("Tower 1, Godrej Waterside" -> "...company Tower").
+CATEGORY_TAIL = re.compile(
+    r"^(.{3,44}?(?:compan(?:y|ies)|agenc(?:y|ies)|services?|consultants?|"
+    r"consulting|designer|developer|solutions?|studio|store|shop|firm|"
+    r"contractor|institute|centre|center))\s+(\S.*)$",
+    re.I,
+)
+# Fallback: category followed by a number-led address.
+CATEGORY_THEN_ADDRESS = re.compile(r"^([A-Za-z][A-Za-z /&'-]{2,40}?)\s+(\d.*)$")
+
+# Segments that are really just a phone number (optionally with opening hours
+# or a review quote trailing) must never be taken as the address.
+LEADING_PHONE = re.compile(r"^\s*(?:\+91[\s-]?)?0?\d[\d\s-]{7,}")
+
+
+def _split_category_address(part: str) -> tuple[str, str]:
+    """Return (category, remainder) if the segment carries both."""
+    m = CATEGORY_TAIL.match(part) or CATEGORY_THEN_ADDRESS.match(part)
+    if not m:
+        return "", part
+    head, tail = m.group(1).strip(), m.group(2).strip()
+    # Only treat the head as a category if it reads like one.
+    if 3 <= len(head) <= 40 and not SERVICE_ATTRS.match(head):
+        return head, tail
+    return "", part
+
+
+def _looks_like_address(part: str) -> bool:
+    """Heuristic: does this "·"-separated segment look like a street address?
+
+    Google's local rows put a short address fragment here (sometimes as terse
+    as "CN-8/2"), so requiring a street keyword alone misses many. Accept any
+    segment carrying a digit plus an address-ish token, or a slash-and-digit
+    unit reference.
+    """
+    low = part.lower()
+    if not re.search(r"\d", part):
+        return False
+    if any(tok in low for tok in ADDRESS_TOKENS):
+        return True
+    # Bare unit references like "CN-8/2" or "J1/16".
+    return bool(re.search(r"[A-Za-z]{1,3}[- ]?\d+/\d+", part))
 
 
 def _trim_address(part: str) -> str:
@@ -408,31 +555,8 @@ def parse_local_results(html: str) -> list[LocalResult]:
             continue
         seen.add(key)
 
-        # --- rating + reviews. Prefer aria-labels, which are more stable
-        # than class names, then fall back to text.
-        aria = " ".join(
-            el.get("aria-label", "")
-            for el in block.select("[aria-label]")
-            if "star" in el.get("aria-label", "").lower()
-            or "review" in el.get("aria-label", "").lower()
-        )
-        probe = aria if aria else text
-
-        m = RATING_REVIEWS.search(probe)
-        if m:
-            item.rating = _to_float(m.group(1))
-            item.reviews = _to_int(m.group(2))
-        else:
-            rm = RATING_ONLY.search(probe)
-            if rm:
-                item.rating = _to_float(rm.group(1))
-            vm = REVIEWS_ONLY.search(probe)
-            if vm:
-                item.reviews = _to_int(vm.group(1))
-
-        # Sanity: ratings are 1-5; anything else is a misparse.
-        if item.rating is not None and not (0.0 < item.rating <= 5.0):
-            item.rating = None
+        # --- rating + reviews (aria-label first; see _rating_and_reviews)
+        item.rating, item.reviews = _rating_and_reviews(block, text)
 
         # --- category and address live in the "·"-separated detail lines.
         # Consider every segment (not just those after the first), because the
@@ -449,17 +573,21 @@ def parse_local_results(html: str) -> list[LocalResult]:
             low = part.lower()
             if low == name_low or low in name_low:
                 continue
-            if re.search(r"\d", part) and any(
-                token in low for token in ("road", "rd", "street", "st", "block", "sector",
-                                           "floor", "tower", "lane", "nagar", "park", "kolkata",
-                                           "howrah", "pin", "7000")
-            ):
-                candidate = _trim_address(part)
-                if len(candidate) > len(item.address):
-                    item.address = candidate
-            elif not item.category and re.fullmatch(r"[A-Za-z /&'-]{3,40}", part):
-                if not RATING_ONLY.search(part) and "review" not in low:
-                    item.category = part
+            part = TRAILING_JUNK.sub("", part).strip(" ,-\u2013\u2014\u00b7|")
+            if not part or SERVICE_ATTRS.match(part):
+                continue
+            if LEADING_PHONE.match(part):
+                continue
+            cat, rest = _split_category_address(part)
+            if cat and not item.category:
+                item.category = cat
+            probe = rest or part
+            if _looks_like_address(probe):
+                if not item.address:
+                    item.address = _trim_address(probe)
+            elif not item.category and re.fullmatch(r"[A-Za-z /&'.,-]{3,44}", probe):
+                if not RATING_ONLY.search(probe) and "review" not in probe.lower():
+                    item.category = probe
 
         # --- website / phone
         for a in block.select("a[href]"):
@@ -550,26 +678,7 @@ def parse_local_pack(html: str) -> list[LocalResult]:
 
         item = LocalResult(name=name)
 
-        aria = " ".join(
-            el.get("aria-label", "")
-            for el in block.select("[aria-label]")
-            if "star" in el.get("aria-label", "").lower()
-            or "review" in el.get("aria-label", "").lower()
-        )
-        probe = aria if aria else text
-        m = RATING_REVIEWS.search(probe)
-        if m:
-            item.rating = _to_float(m.group(1))
-            item.reviews = _to_int(m.group(2))
-        else:
-            rm = RATING_ONLY.search(probe)
-            if rm:
-                item.rating = _to_float(rm.group(1))
-            vm = REVIEWS_ONLY.search(probe)
-            if vm:
-                item.reviews = _to_int(vm.group(1))
-        if item.rating is not None and not (0.0 < item.rating <= 5.0):
-            item.rating = None
+        item.rating, item.reviews = _rating_and_reviews(block, text)
 
         parts = [p.strip() for p in re.split(r"\u00b7|\|", text) if p.strip()]
         name_low = name.lower()
@@ -581,16 +690,21 @@ def parse_local_pack(html: str) -> list[LocalResult]:
             low = part.lower()
             if low == name_low:
                 continue
-            if re.search(r"\d", part) and any(
-                tok in low for tok in ("road", "rd", "street", "block", "sector", "floor",
-                                       "tower", "lane", "nagar", "park", "kolkata", "howrah", "7000")
-            ):
-                cand = _trim_address(part)
-                if len(cand) > len(item.address):
-                    item.address = cand
-            elif not item.category and re.fullmatch(r"[A-Za-z /&'-]{3,40}", part):
-                if not RATING_ONLY.search(part) and "review" not in low:
-                    item.category = part
+            part = TRAILING_JUNK.sub("", part).strip(" ,-\u2013\u2014\u00b7|")
+            if not part or SERVICE_ATTRS.match(part):
+                continue
+            if LEADING_PHONE.match(part):
+                continue
+            cat, rest = _split_category_address(part)
+            if cat and not item.category:
+                item.category = cat
+            probe = rest or part
+            if _looks_like_address(probe):
+                if not item.address:
+                    item.address = _trim_address(probe)
+            elif not item.category and re.fullmatch(r"[A-Za-z /&'.,-]{3,44}", probe):
+                if not RATING_ONLY.search(probe) and "review" not in probe.lower():
+                    item.category = probe
 
         for a in block.select("a[href]"):
             u = _clean_url(a.get("href", ""))
