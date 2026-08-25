@@ -36,6 +36,7 @@ from .website import WebsiteData, enrich_from_website
 
 logger = logging.getLogger(__name__)
 
+
 def _domain(url: str) -> str:
     try:
         host = (urlparse(url).netloc or "").lower()
@@ -95,6 +96,19 @@ def _merge_place(prev, row) -> None:
 
 async def main() -> None:
     async with Actor:
+        # Route this package's loggers through Apify's handler at INFO level.
+        # Without this, `logging.getLogger(__name__)` inherits the root logger's
+        # default WARNING level and every progress line is silently dropped --
+        # the run looks frozen even while it is working normally.
+        pkg_logger = logging.getLogger("my_actor")
+        pkg_logger.setLevel(logging.INFO)
+        if not pkg_logger.handlers:
+            for handler in Actor.log.handlers:
+                pkg_logger.addHandler(handler)
+            if not pkg_logger.handlers:  # fallback if the SDK exposed none
+                logging.basicConfig(level=logging.INFO)
+        pkg_logger.propagate = not pkg_logger.handlers
+
         cfg = await Actor.get_input() or {}
 
         location = (cfg.get("location") or "").strip()
@@ -157,6 +171,39 @@ async def main() -> None:
         # always be written -- they are needed exactly when you did not think
         # to enable debug mode beforehand.
         store = await Actor.open_key_value_store()
+
+        logger.info(
+            "Config: location=%r | %s areas | %s terms | %s pages/term | "
+            "serpBudget=%s | website=%s founderSerp=%s employeeSerp=%s",
+            location, len(areas), len(terms), max_pages, serp_budget or "unlimited",
+            do_website, do_serp_founder, do_serp_employees,
+        )
+        est = len(areas) * len(terms) * max_pages
+        logger.info(
+            "Worst-case discovery requests: %s. At ~2s politeness delay plus fetch "
+            "time that is roughly %s-%s minutes for discovery alone.",
+            est, est * 3 // 60, est * 6 // 60,
+        )
+        if est * 4 > 280:
+            logger.warning(
+                "This configuration cannot finish inside the Apify default 300s "
+                "timeout. Set Input > Run options > Timeout to at least %s seconds, "
+                "or reduce maxLocalPagesPerTerm / areas / searchTerms.",
+                max(3600, est * 10),
+            )
+        if req_timeout > 120:
+            logger.warning(
+                "requestTimeoutSecs=%s is the PER-REQUEST timeout, not the run "
+                "timeout. A value this high lets one hung server stall the run; 20-30 "
+                "is normal. The run timeout lives in Input > Run options.",
+                req_timeout,
+            )
+        if min_rating is not None:
+            logger.warning(
+                "minRating=%s drops every company with NO Google rating at all, which "
+                "is most small and new firms. Leave it empty to keep unrated companies.",
+                min_rating,
+            )
 
         # ---------------------------------------------------- Stage 1: discover
         discovered: dict[str, dict] = {}
@@ -296,12 +343,15 @@ async def main() -> None:
                 if wd and wd.founder_name:
                     founder = (wd.founder_name, wd.founder_role or "", "high", "company website")
 
-                if do_serp_founder and not wd or (do_serp_founder and not founder[0]):
-                    if not serp.stats.exhausted:
-                        q = f'"{place.name}" founder OR CEO {location}'
-                        results, _ = await serp.organic_search(q)
-                        if results:
-                            founder = extract_founder(results, place.name)
+                # Fall back to a Google lookup only when the company's own site
+                # did not name a founder. (Parenthesised deliberately: `and`
+                # binds tighter than `or`, so the unbracketed form read
+                # confusingly even though it happened to behave the same.)
+                if do_serp_founder and not founder[0] and not serp.stats.exhausted:
+                    q = f'"{place.name}" founder OR CEO {location}'
+                    results, _ = await serp.organic_search(q)
+                    if results:
+                        founder = extract_founder(results, place.name)
 
                 if do_serp_employees and not serp.stats.exhausted:
                     q = f'site:linkedin.com/company "{place.name}"'
