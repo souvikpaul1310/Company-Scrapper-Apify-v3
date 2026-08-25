@@ -1,53 +1,21 @@
 {
-  "actorSpecification": 1,
-  "fields": {},
-  "views": {
-    "overview": {
+  "actorOutputSchemaVersion": 1,
+  "title": "IT Company Finder output",
+  "properties": {
+    "companies": {
+      "type": "string",
       "title": "Companies found",
-      "transformation": {
-        "fields": [
-          "company_name", "category_label", "address", "website_url",
-          "rating", "reviews", "owner_founder", "employees", "company_type"
-        ]
-      },
-      "display": {
-        "component": "table",
-        "properties": {
-          "company_name": { "label": "Company", "format": "text" },
-          "category_label": { "label": "Sector", "format": "text" },
-          "address": { "label": "Address", "format": "text" },
-          "website_url": { "label": "Website", "format": "link" },
-          "rating": { "label": "Google Rating", "format": "number" },
-          "reviews": { "label": "Reviews", "format": "number" },
-          "owner_founder": { "label": "Owner / Founder", "format": "text" },
-          "employees": { "label": "Employees", "format": "text" },
-          "company_type": { "label": "Type", "format": "text" }
-        }
-      }
+      "template": "{{links.apiDefaultDatasetUrl}}/items"
     },
-    "detailed": {
-      "title": "With confidence & provenance",
-      "transformation": {
-        "fields": [
-          "company_name", "category", "category_label", "website_url",
-          "rating", "reviews",
-          "owner_founder", "owner_founder_role", "owner_founder_confidence",
-          "employees", "employees_confidence",
-          "company_type", "company_type_confidence", "company_type_evidence",
-          "phone", "google_category", "found_via_term", "found_via_area", "notes"
-        ]
-      },
-      "display": { "component": "table" }
+    "companiesCsv": {
+      "type": "string",
+      "title": "Download as CSV",
+      "template": "{{links.apiDefaultDatasetUrl}}/items?format=csv"
     },
-    "leads": {
-      "title": "Outreach-ready (verified founder)",
-      "transformation": {
-        "fields": [
-          "company_name", "owner_founder", "owner_founder_role",
-          "website_url", "phone", "employees", "company_type", "rating"
-        ]
-      },
-      "display": { "component": "table" }
+    "debugHtml": {
+      "type": "string",
+      "title": "Debug HTML snapshots",
+      "template": "{{links.apiDefaultKeyValueStoreUrl}}/keys"
     }
   }
 }
