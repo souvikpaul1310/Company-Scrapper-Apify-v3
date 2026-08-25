@@ -152,7 +152,11 @@ async def main() -> None:
             )
             return
 
-        store = await Actor.open_key_value_store() if debug_dump else None
+        # Always open the store. `debugDumpHtml` controls the routine per-term
+        # snapshots, but failure dumps (BLOCKED / HTTP-error responses) must
+        # always be written -- they are needed exactly when you did not think
+        # to enable debug mode beforehand.
+        store = await Actor.open_key_value_store()
 
         # ---------------------------------------------------- Stage 1: discover
         discovered: dict[str, dict] = {}
