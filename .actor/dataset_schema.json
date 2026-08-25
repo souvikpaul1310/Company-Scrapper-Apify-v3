@@ -5,15 +5,26 @@
     "overview": {
       "title": "Companies",
       "transformation": {
-        "fields": ["company_name","address","website_url","rating","reviews","owner_founder","employees","company_type"]
+        "fields": [
+          "company_name",
+          "category_label",
+          "address",
+          "website_url",
+          "rating",
+          "reviews",
+          "owner_founder",
+          "employees",
+          "company_type"
+        ]
       },
       "display": {
         "component": "table",
         "properties": {
           "company_name": { "label": "Company", "format": "text" },
+          "category_label": { "label": "Sector", "format": "text" },
           "address": { "label": "Address", "format": "text" },
           "website_url": { "label": "Website", "format": "link" },
-          "rating": { "label": "Rating", "format": "number" },
+          "rating": { "label": "Google Rating", "format": "number" },
           "reviews": { "label": "Reviews", "format": "number" },
           "owner_founder": { "label": "Owner / Founder", "format": "text" },
           "employees": { "label": "Employees", "format": "text" },
@@ -22,9 +33,46 @@
       }
     },
     "detailed": {
-      "title": "With confidence & sources",
+      "title": "With confidence & provenance",
       "transformation": {
-        "fields": ["company_name","website_url","rating","reviews","owner_founder","owner_founder_role","owner_founder_confidence","employees","employees_confidence","company_type","company_type_confidence","company_type_evidence","phone","category","search_term","notes"]
+        "fields": [
+          "company_name",
+          "category",
+          "category_label",
+          "website_url",
+          "rating",
+          "reviews",
+          "owner_founder",
+          "owner_founder_role",
+          "owner_founder_confidence",
+          "employees",
+          "employees_confidence",
+          "company_type",
+          "company_type_confidence",
+          "company_type_evidence",
+          "phone",
+          "google_category",
+          "found_via_term",
+          "found_via_area",
+          "notes"
+        ]
+      },
+      "display": { "component": "table" }
+    },
+    "leads": {
+      "title": "Outreach-ready",
+      "transformation": {
+        "fields": [
+          "company_name",
+          "owner_founder",
+          "owner_founder_role",
+          "owner_founder_confidence",
+          "website_url",
+          "phone",
+          "employees",
+          "company_type",
+          "rating"
+        ]
       },
       "display": { "component": "table" }
     }
