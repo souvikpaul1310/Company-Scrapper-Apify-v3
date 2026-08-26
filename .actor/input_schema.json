@@ -29,42 +29,12 @@
       "editor": "select",
       "items": {
         "type": "string",
-        "enum": [
-          "software",
-          "web_mobile",
-          "digital_marketing",
-          "data_ai",
-          "cybersecurity",
-          "erp_crm",
-          "game_dev",
-          "it_services"
-        ],
-        "enumTitles": [
-          "Software / product engineering",
-          "Web & mobile development",
-          "Digital marketing / SEO",
-          "Data / AI / analytics",
-          "Cybersecurity",
-          "ERP / CRM implementation",
-          "Game development / animation",
-          "IT services / consulting"
-        ]
+        "enum": ["software", "web_mobile", "digital_marketing", "data_ai", "cybersecurity", "erp_crm", "game_dev", "it_services"],
+        "enumTitles": ["Software / product engineering", "Web & mobile development", "Digital marketing / SEO", "Data / AI / analytics", "Cybersecurity", "ERP / CRM implementation", "Game development / animation", "IT services / consulting"]
       },
-      "description": "Which sectors to search for and keep. Defaults to the five commercial-agency sectors. Data/AI, cybersecurity and game development are available but off by default; note that a software firm which merely mentions AI is still kept as software - only pure plays in an unselected sector are dropped.",
-      "prefill": [
-        "software",
-        "web_mobile",
-        "digital_marketing",
-        "erp_crm",
-        "it_services"
-      ],
-      "default": [
-        "software",
-        "web_mobile",
-        "digital_marketing",
-        "erp_crm",
-        "it_services"
-      ]
+      "default": ["software", "web_mobile", "digital_marketing", "erp_crm", "it_services"],
+      "prefill": ["software", "web_mobile", "digital_marketing", "erp_crm", "it_services"],
+      "description": "Which sectors to search for and keep. Defaults to the five commercial-agency sectors. Data/AI, cybersecurity and game development are available but off by default; note that a software firm which merely mentions AI is still kept as software - only pure plays in an unselected sector are dropped."
     },
     "searchTerms": {
       "title": "Search terms",
@@ -77,26 +47,8 @@
       "type": "string",
       "editor": "select",
       "default": "IN",
-      "enum": [
-        "IN",
-        "US",
-        "GB",
-        "AU",
-        "CA",
-        "DE",
-        "SG",
-        "AE"
-      ],
-      "enumTitles": [
-        "India",
-        "United States",
-        "United Kingdom",
-        "Australia",
-        "Canada",
-        "Germany",
-        "Singapore",
-        "UAE"
-      ],
+      "enum": ["IN", "US", "GB", "AU", "CA", "DE", "SG", "AE"],
+      "enumTitles": ["India", "United States", "United Kingdom", "Australia", "Canada", "Germany", "Singapore", "UAE"],
       "description": "Selects both the Google domain and the proxy exit country. Must match your target market or results come back for the wrong locale."
     },
     "maxCompanies": {
@@ -138,7 +90,7 @@
       "title": "Minimum Google rating",
       "type": "number",
       "editor": "number",
-      "description": "Optional, e.g. 4.5. Leave empty to keep all. Note: unrated new companies are dropped when this is set."
+      "description": "Optional, e.g. 4.5. Leave EMPTY to keep all companies. Warning: setting any value (even 1) drops every company that has no Google rating at all, which is most small and new firms."
     },
     "minReviews": {
       "title": "Minimum number of reviews",
@@ -183,21 +135,26 @@
       "description": "How many company websites to crawl at once. Does not affect SERP requests, which are always sequential and rate-limited."
     },
     "requestTimeoutSecs": {
-      "title": "Per-request timeout (seconds)",
+      "title": "Website request timeout (seconds)",
       "type": "integer",
       "editor": "number",
       "default": 20,
-      "description": "How long to wait for each request before giving up."
+      "description": "How long to wait when crawling a company's own website. 20-30 is normal. This is NOT the run timeout (that lives in Input > Run options) and NOT the Google fetch timeout (see serpRequestTimeoutSecs)."
+    },
+    "serpRequestTimeoutSecs": {
+      "title": "SERP request timeout (seconds)",
+      "type": "integer",
+      "editor": "number",
+      "default": 120,
+      "description": "How long to wait for each Google fetch through Apify's GOOGLE_SERP proxy. The proxy scrapes Google server-side, so a single fetch routinely needs 30-90 seconds; values under 60 fail every request with an empty timeout. This is separate from requestTimeoutSecs, which applies to company websites."
     },
     "debugDumpHtml": {
       "title": "Save raw Google HTML for debugging",
       "type": "boolean",
       "editor": "checkbox",
       "default": false,
-      "description": "Saves the first local-results page per search term to the key-value store. Turn this on if results go empty - Google rotates its CSS class names, and the saved HTML is what you need to fix the selectors."
+      "description": "Saves the first local-results page per search term to the key-value store. Turn this on if results go empty - Google rotates its CSS class names, and the saved HTML is what you need to fix the selectors. Failure dumps (BLOCKED / HTTP errors) are always saved regardless of this setting."
     }
   },
-  "required": [
-    "location"
-  ]
+  "required": ["location"]
 }
