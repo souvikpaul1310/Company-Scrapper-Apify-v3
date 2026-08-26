@@ -148,7 +148,14 @@ async def main() -> None:
 
         pages_per_site = max(1, int(cfg.get("maxPagesPerSite") or 5))
         concurrency = max(1, int(cfg.get("concurrency") or 8))
+        # Two very different timeouts, deliberately separate inputs:
+        #   req_timeout  - crawling company websites. Ordinary HTTP; 20s is ample.
+        #   serp_timeout - fetching via Apify's GOOGLE_SERP proxy, which scrapes
+        #                  Google server-side and routinely needs 30-90s. Capping
+        #                  this at 20s fails every single request with an empty
+        #                  asyncio.TimeoutError.
         req_timeout = max(5, int(cfg.get("requestTimeoutSecs") or 20))
+        serp_timeout = max(30, int(cfg.get("serpRequestTimeoutSecs") or 120))
 
         # The GOOGLE_SERP group needs the proxy password, which the platform
         # injects into every run.
@@ -198,6 +205,13 @@ async def main() -> None:
                 "is normal. The run timeout lives in Input > Run options.",
                 req_timeout,
             )
+        if serp_timeout < 60:
+            logger.warning(
+                "serpRequestTimeoutSecs=%s is likely too low. Apify's GOOGLE_SERP "
+                "proxy scrapes server-side and a fetch often needs 30-90s; short "
+                "timeouts fail every request with an empty TimeoutError.",
+                serp_timeout,
+            )
         if min_rating is not None:
             logger.warning(
                 "minRating=%s drops every company with NO Google rating at all, which "
@@ -220,7 +234,7 @@ async def main() -> None:
         async with SerpClient(
             password,
             country=country,
-            timeout=req_timeout,
+            timeout=serp_timeout,
             budget=serp_budget,
             store=store,
         ) as serp:
@@ -417,8 +431,9 @@ async def main() -> None:
             len(rows_out), filled("owner_founder"), filled("employees"), filled("company_type"),
         )
         logger.info(
-            "SERP usage: %s requests (budget %s), %s blocked, %s failed",
-            stats.requests, stats.budget or "unlimited", stats.blocked, stats.failed,
+            "SERP usage: %s requests (budget %s), %s blocked, %s timed out, %s failed",
+            stats.requests, stats.budget or "unlimited", stats.blocked,
+            stats.timeouts, stats.failed,
         )
         by_cat: dict[str, int] = {}
         for r in rows_out:
