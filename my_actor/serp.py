@@ -130,6 +130,7 @@ class SerpStats:
     requests: int = 0
     blocked: int = 0
     failed: int = 0
+    timeouts: int = 0
     budget: int = 0
     dumps: list[str] = field(default_factory=list)
 
@@ -146,7 +147,7 @@ class SerpClient:
         proxy_password: str,
         *,
         country: str = "IN",
-        timeout: int = 30,
+        timeout: int = 120,
         budget: int = 0,
         min_delay: float = 1.0,
         max_delay: float = 2.5,
@@ -246,7 +247,24 @@ class SerpClient:
                     return body
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning("SERP fetch error (attempt %s) for %s: %s", attempt, label or url, exc)
+                # asyncio.TimeoutError stringifies to "", so log the class name
+                # too or the log line reads "fetch error for X:" with no cause.
+                kind = type(exc).__name__
+                detail = str(exc) or "(no message)"
+                logger.warning(
+                    "SERP fetch error (attempt %s, %s: %s) for %s",
+                    attempt, kind, detail, label or url,
+                )
+                if isinstance(exc, asyncio.TimeoutError):
+                    self.stats.timeouts += 1
+                    if self.stats.timeouts == 1:
+                        logger.warning(
+                            "Timed out after %ss. Apify's GOOGLE_SERP proxy scrapes "
+                            "server-side and a single fetch often needs 30-90s, so a "
+                            "short timeout fails every request. Raise "
+                            "serpRequestTimeoutSecs (currently %ss).",
+                            self.timeout.total, self.timeout.total,
+                        )
                 await asyncio.sleep(2 * attempt)
 
         self.stats.failed += 1
