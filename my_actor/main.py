@@ -17,13 +17,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from dataclasses import asdict
 from urllib.parse import urlparse
 
-from apify import Actor
+from apify import Actor, Event
 
 from .classify import classify_company_type
 from .people import extract_employees, extract_founder
-from .serp import SerpClient
+from .serp import LocalResult, SerpClient
 from .taxonomy import (
     CATEGORY_LABELS,
     DEFAULT_CATEGORIES,
@@ -32,9 +33,51 @@ from .taxonomy import (
     resolve_category,
     search_terms_for,
 )
-from .website import WebsiteData, enrich_from_website
+from .website import WebsiteData, enrich_many
 
 logger = logging.getLogger(__name__)
+
+# Apify migrates long-running actors between hosts without warning; when that
+# happens the container restarts and main() runs again from the top. Discovery
+# is the expensive stage (hours of SERP requests), so it is checkpointed to the
+# key-value store and resumed rather than repeated.
+STATE_KEY = "STATE-discovery.json"
+CHECKPOINT_EVERY = 10  # queries
+PUSH_BATCH = 25        # rows per push_data call
+
+
+def _serialise_state(discovered: dict, alias: dict, done: set) -> dict:
+    return {
+        "discovered": {
+            key: {
+                "place": asdict(val["place"]),
+                "term": val.get("term", ""),
+                "area": val.get("area", ""),
+                "category": val.get("category", ""),
+            }
+            for key, val in discovered.items()
+        },
+        "alias": alias,
+        "done": sorted(f"{a}\t{t}" for a, t in done),
+    }
+
+
+def _deserialise_state(payload: dict) -> tuple[dict, dict, set]:
+    discovered: dict = {}
+    for key, val in (payload.get("discovered") or {}).items():
+        discovered[key] = {
+            "place": LocalResult(**val["place"]),
+            "term": val.get("term", ""),
+            "area": val.get("area", ""),
+            "category": val.get("category", ""),
+        }
+    alias = payload.get("alias") or {}
+    done = set()
+    for row in payload.get("done") or []:
+        area, _, term = row.partition("\t")
+        if term:
+            done.add((area, term))
+    return discovered, alias, done
 
 
 def _domain(url: str) -> str:
@@ -92,6 +135,47 @@ def _merge_place(prev, row) -> None:
     # reads better in a lead list.
     if len(row.name or "") > len(prev.name or ""):
         prev.name = row.name
+
+
+def _build_row(entry: dict, wd) -> dict:
+    """Assemble one output row from a discovery entry plus website data."""
+    place = entry["place"]
+    f_name, f_role, f_conf, f_note = entry.get("founder", ("", "", "not found", ""))
+    e_val, e_conf, e_note = entry.get("employees", ("", "not found", ""))
+
+    if wd and wd.company_type:
+        c_type, c_conf, c_evidence = wd.company_type, wd.type_confidence, wd.type_evidence
+    else:
+        c_type, c_conf, c_evidence = "not found", "not found", ""
+
+    notes = [n for n in (f_note, e_note) if n]
+    if wd and not wd.reachable:
+        notes.append("website did not respond")
+    if not entry.get("enriched"):
+        notes.append("not SERP-enriched (cap reached or run ended)")
+
+    return {
+        "company_name": place.name,
+        "category": entry.get("category", ""),
+        "category_label": CATEGORY_LABELS.get(entry.get("category", ""), ""),
+        "address": place.address or "not found",
+        "website_url": place.website or "not found",
+        "rating": place.rating,
+        "reviews": place.reviews,
+        "owner_founder": f_name or "not found",
+        "owner_founder_role": f_role or "",
+        "owner_founder_confidence": f_conf,
+        "employees": e_val or "not found",
+        "employees_confidence": e_conf,
+        "company_type": c_type,
+        "company_type_confidence": c_conf,
+        "company_type_evidence": c_evidence,
+        "phone": place.phone or "",
+        "google_category": place.category or "",
+        "found_via_term": entry.get("term", ""),
+        "found_via_area": entry.get("area", ""),
+        "notes": "; ".join(notes),
+    }
 
 
 async def main() -> None:
@@ -173,11 +257,36 @@ async def main() -> None:
             )
             return
 
-        # Always open the store. `debugDumpHtml` controls the routine per-term
-        # snapshots, but failure dumps (BLOCKED / HTTP-error responses) must
-        # always be written -- they are needed exactly when you did not think
-        # to enable debug mode beforehand.
         store = await Actor.open_key_value_store()
+
+        # Apify sends MIGRATING shortly before moving the container. Persist
+        # whatever discovery has found so the replacement container resumes
+        # instead of starting over. NOTE: a migration does NOT reset the run
+        # timeout -- the clock keeps running from the original start.
+        migration_state: dict = {"discovered": None, "alias": None, "done": None}
+
+        async def _on_migrating(_event=None) -> None:
+            try:
+                if migration_state["discovered"] is not None:
+                    await store.set_value(
+                        STATE_KEY,
+                        _serialise_state(
+                            migration_state["discovered"],
+                            migration_state["alias"],
+                            migration_state["done"],
+                        ),
+                    )
+                    logger.warning(
+                        "Migration signalled: checkpointed %s companies before handover.",
+                        len(migration_state["discovered"]),
+                    )
+            except Exception as exc:
+                logger.warning("Could not checkpoint on migration: %s", exc)
+
+        try:
+            Actor.on(Event.MIGRATING, _on_migrating)
+        except Exception as exc:  # pragma: no cover - event API is best-effort
+            logger.debug("Could not register migration handler: %s", exc)
 
         logger.info(
             "Config: location=%r | %s areas | %s terms | %s pages/term | "
@@ -222,7 +331,31 @@ async def main() -> None:
         # ---------------------------------------------------- Stage 1: discover
         discovered: dict[str, dict] = {}
         alias: dict[str, str] = {}   # every identity key -> canonical record key
+        done_queries: set[tuple[str, str]] = set()
         reject_tally: dict[str, int] = {}
+
+        # Resume from a checkpoint if a previous attempt was migrated mid-run.
+        if cfg.get("resumeFromCheckpoint", True):
+            try:
+                saved = await store.get_value(STATE_KEY)
+            except Exception:
+                saved = None
+            if saved:
+                try:
+                    discovered, alias, done_queries = _deserialise_state(saved)
+                    logger.info(
+                        "Resumed from checkpoint: %s companies already found, "
+                        "%s of the query plan already done.",
+                        len(discovered), len(done_queries),
+                    )
+                except Exception as exc:
+                    logger.warning("Checkpoint unreadable (%s); starting fresh.", exc)
+                    discovered, alias, done_queries = {}, {}, set()
+
+        migration_state["discovered"] = discovered
+        migration_state["alias"] = alias
+        migration_state["done"] = done_queries
+
         plan = [(area, term) for area in areas for term in terms]
         logger.info(
             "Discovery plan: %s areas x %s terms = %s queries, up to %s pages each "
@@ -238,9 +371,12 @@ async def main() -> None:
             budget=serp_budget,
             store=store,
         ) as serp:
+            completed_this_run = 0
             for area, term in plan:
                 if serp.stats.exhausted or (target and len(discovered) >= target):
                     break
+                if (area, term) in done_queries:
+                    continue
                 query = f"{term} in {area}"
 
                 for page in range(max_pages):
@@ -264,7 +400,10 @@ async def main() -> None:
                             if matched:
                                 category, reason = resolve_category(matched, categories)
                             if not category:
-                                bucket = reason.split(" ")[0] if reason else "unknown"
+                                # Keep the whole reason up to the parenthetical
+                                # detail: splitting on the first space turned
+                                # "no sector signal" into a useless "no".
+                                bucket = (reason or "unknown").split(" (")[0]
                                 reject_tally[bucket] = reject_tally.get(bucket, 0) + 1
                                 continue
 
@@ -300,6 +439,27 @@ async def main() -> None:
                     if len(rows) < 5:
                         break  # thin page: pagination has run out
 
+                done_queries.add((area, term))
+                completed_this_run += 1
+                if completed_this_run % CHECKPOINT_EVERY == 0:
+                    try:
+                        await store.set_value(
+                            STATE_KEY, _serialise_state(discovered, alias, done_queries)
+                        )
+                        logger.info(
+                            "Checkpoint saved (%s companies, %s/%s queries done)",
+                            len(discovered), len(done_queries), len(plan),
+                        )
+                    except Exception as exc:
+                        logger.warning("Could not save checkpoint: %s", exc)
+
+            try:
+                await store.set_value(
+                    STATE_KEY, _serialise_state(discovered, alias, done_queries)
+                )
+            except Exception:
+                pass
+
             logger.info("Discovery finished: %s unique companies", len(discovered))
             if reject_tally:
                 logger.info(
@@ -326,27 +486,70 @@ async def main() -> None:
             # ------------------------------------- Stage 2: crawl own websites
             website_data: dict[str, WebsiteData] = {}
             if do_website:
-                sem = asyncio.Semaphore(concurrency)
-
-                async def crawl(entry) -> None:
-                    place = entry["place"]
-                    if not place.website:
-                        return
-                    async with sem:
-                        try:
-                            website_data[place.name] = await enrich_from_website(
-                                place.website,
-                                max_pages=pages_per_site,
-                                timeout_secs=req_timeout,
-                            )
-                        except Exception as exc:
-                            logger.warning("Website crawl failed for %s: %s", place.name, exc)
-
-                await asyncio.gather(*(crawl(e) for e in selected))
-                logger.info("Crawled %s websites", len(website_data))
+                # Use enrich_many, not enrich_from_website: it owns the
+                # aiohttp session, bounds concurrency, and isolates per-site
+                # failures. Calling enrich_from_website directly means passing
+                # a session yourself, and its timeout kwarg is `timeout` --
+                # getting either wrong fails every single site.
+                sites = [e["place"].website or "" for e in selected]
+                results = await enrich_many(
+                    sites,
+                    concurrency=concurrency,
+                    timeout=req_timeout,
+                    max_pages=pages_per_site,
+                    log=None,
+                )
+                reachable = 0
+                for entry, wd in zip(selected, results):
+                    website_data[entry["place"].name] = wd
+                    if wd.reachable:
+                        reachable += 1
+                logger.info(
+                    "Crawled %s sites, %s reachable, %s founders named on-site",
+                    len(sites), reachable,
+                    sum(1 for w in results if w.founder_name),
+                )
 
             # ------------------------------------ Stage 3: SERP enrichment
-            for entry in selected:
+            # Enrichment costs ~2 SERP requests per company, each up to
+            # serpRequestTimeoutSecs. For 600+ companies that is 10+ hours, so
+            # it is capped and prioritised: the companies with the most Google
+            # reviews are the ones a lead list actually cares about.
+            enrich_cap = int(cfg.get("maxEnrichCompanies") or 0)
+            order = sorted(
+                selected,
+                key=lambda e: (e["place"].reviews or 0, e["place"].rating or 0),
+                reverse=True,
+            )
+            to_enrich = order[:enrich_cap] if enrich_cap else order
+            if enrich_cap and len(order) > enrich_cap:
+                logger.info(
+                    "Enriching the top %s of %s companies by review count "
+                    "(maxEnrichCompanies). The rest keep fields 1-5 plus website data.",
+                    len(to_enrich), len(order),
+                )
+
+            # Rows are pushed to the dataset in batches AS THEY COMPLETE, not
+            # at the end. A previous run spent four hours on discovery and
+            # enrichment, hit the run timeout mid-enrichment, and saved nothing
+            # at all -- push_data only ran after every company was finished.
+            # Partial output beats an empty dataset.
+            pending: list[dict] = []
+            pushed = 0
+
+            async def flush(force: bool = False) -> None:
+                nonlocal pending, pushed
+                if pending and (force or len(pending) >= PUSH_BATCH):
+                    batch, pending = pending, []
+                    try:
+                        await Actor.push_data(batch)
+                        pushed += len(batch)
+                        logger.info("Pushed %s rows (total %s)", len(batch), pushed)
+                    except Exception as exc:
+                        logger.warning("push_data failed (%s); re-queueing", exc)
+                        pending = batch + pending
+
+            for i, entry in enumerate(to_enrich, 1):
                 place = entry["place"]
                 wd = website_data.get(place.name)
 
@@ -358,9 +561,7 @@ async def main() -> None:
                     founder = (wd.founder_name, wd.founder_role or "", "high", "company website")
 
                 # Fall back to a Google lookup only when the company's own site
-                # did not name a founder. (Parenthesised deliberately: `and`
-                # binds tighter than `or`, so the unbracketed form read
-                # confusingly even though it happened to behave the same.)
+                # did not name a founder.
                 if do_serp_founder and not founder[0] and not serp.stats.exhausted:
                     q = f'"{place.name}" founder OR CEO {location}'
                     results, _ = await serp.organic_search(q)
@@ -377,58 +578,39 @@ async def main() -> None:
 
                 entry["founder"] = founder
                 entry["employees"] = employees
+                entry["enriched"] = True
 
+                pending.append(_build_row(entry, wd))
+                await flush()
+
+                if i % 25 == 0:
+                    logger.info(
+                        "Enriched %s/%s (SERP used %s of %s)",
+                        i, len(to_enrich), serp.stats.requests, serp_budget or "unlimited",
+                    )
+
+            await flush(force=True)
             stats = serp.stats
 
-        # ------------------------------------------------ Stage 4: emit rows
+        # ------------------------------------------------ Stage 4: emit the rest
+        # Everything not SERP-enriched still carries fields 1-5 plus whatever
+        # the website crawl found, which is the bulk of the value.
+        remainder = [e for e in selected if not e.get("enriched")]
         rows_out = []
-        for entry in selected:
-            place = entry["place"]
-            wd = website_data.get(place.name)
-            f_name, f_role, f_conf, f_note = entry.get("founder", ("", "", "not found", ""))
-            e_val, e_conf, e_note = entry.get("employees", ("", "not found", ""))
-
-            if wd and wd.company_type:
-                c_type, c_conf, c_evidence = wd.company_type, wd.type_confidence, wd.type_evidence
-            else:
-                c_type, c_conf, c_evidence = "not found", "not found", ""
-
-            notes = [n for n in (f_note, e_note) if n]
-            if wd and not wd.reachable:
-                notes.append("website did not respond")
-
-            rows_out.append(
-                {
-                    "company_name": place.name,
-                    "category": entry.get("category", ""),
-                    "category_label": CATEGORY_LABELS.get(entry.get("category", ""), ""),
-                    "address": place.address or "not found",
-                    "website_url": place.website or "not found",
-                    "rating": place.rating,
-                    "reviews": place.reviews,
-                    "owner_founder": f_name or "not found",
-                    "owner_founder_role": f_role or "",
-                    "owner_founder_confidence": f_conf,
-                    "employees": e_val or "not found",
-                    "employees_confidence": e_conf,
-                    "company_type": c_type,
-                    "company_type_confidence": c_conf,
-                    "company_type_evidence": c_evidence,
-                    "phone": place.phone or "",
-                    "google_category": place.category or "",
-                    "found_via_term": entry.get("term", ""),
-                    "found_via_area": entry.get("area", ""),
-                    "notes": "; ".join(notes),
-                }
-            )
-
+        for entry in remainder:
+            rows_out.append(_build_row(entry, website_data.get(entry["place"].name)))
         if rows_out:
-            await Actor.push_data(rows_out)
+            for i in range(0, len(rows_out), PUSH_BATCH):
+                await Actor.push_data(rows_out[i:i + PUSH_BATCH])
+            logger.info("Pushed %s un-enriched rows", len(rows_out))
+
+        total_rows = pushed + len(rows_out)
+        rows_out = [_build_row(e, website_data.get(e["place"].name)) for e in selected]
 
         filled = lambda k: sum(1 for r in rows_out if r[k] not in ("", None, "not found"))
         logger.info(
-            "Done. %s companies | founder %s | employees %s | type %s",
-            len(rows_out), filled("owner_founder"), filled("employees"), filled("company_type"),
+            "Done. %s rows saved | founder %s | employees %s | type %s",
+            total_rows, filled("owner_founder"), filled("employees"), filled("company_type"),
         )
         logger.info(
             "SERP usage: %s requests (budget %s), %s blocked, %s timed out, %s failed",
