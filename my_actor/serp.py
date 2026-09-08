@@ -78,6 +78,11 @@ BLOCK_TITLE = re.compile(r"<title[^>]*>\s*(?:Sorry|Error|Moved|302)", re.I)
 # "sorry" pages are a few KB; a results page is 200 KB+.
 BLOCK_SIZE_CEILING = 60_000
 
+# Consecutive tbm=lcl failures before falling back to plain search. A run of
+# 690 queries will hit occasional proxy timeouts; a few unlucky ones must not
+# cost the remaining hundreds of queries their yield.
+LCL_FAILURE_LIMIT = 6
+
 
 def _is_blocked(body: str, status: int) -> str:
     """Return a reason string if this response is a block page, else ''."""
@@ -306,15 +311,27 @@ class SerpClient:
             if html:
                 rows = parse_local_results(html)
                 if rows:
+                    # Reset on success. Counting CUMULATIVE failures instead of
+                    # consecutive ones let three scattered proxy timeouts,
+                    # spread over an hour, permanently disable a feature that
+                    # was working fine -- costing ~165 queries their 20-row
+                    # pages and dropping them to 3-result local packs.
+                    self._lcl_failures = 0
                     return rows, html
-                logger.info("tbm=lcl returned no parseable rows for %r", query)
+                if start > 0:
+                    # A deep page legitimately runs out of results. That is
+                    # pagination ending, not the local finder being refused, so
+                    # it must not count towards the fallback threshold.
+                    logger.debug("tbm=lcl page %s empty for %r (pagination end)", start, query)
+                    return [], html
+                logger.info("tbm=lcl returned no rows on page 1 for %r", query)
             self._lcl_failures += 1
-            if self._lcl_failures >= 3:
+            if self._lcl_failures >= LCL_FAILURE_LIMIT:
                 self._lcl_disabled = True
                 logger.warning(
-                    "tbm=lcl failed %s times; falling back to plain search for the rest "
-                    "of this run. Apify's GOOGLE_SERP proxy only documents support for "
-                    "Google Search and Shopping, so the local-finder tab may be refused.",
+                    "tbm=lcl failed %s times IN A ROW; falling back to plain search for "
+                    "the rest of this run. Plain search yields ~3 businesses per query "
+                    "instead of ~20, so coverage per request drops sharply.",
                     self._lcl_failures,
                 )
 
@@ -528,6 +545,89 @@ def _clean_url(href: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
 
 
+# --------------------------------------------------- website link extraction
+
+# The anchor whose visible text is Google's "Website" button.
+WEBSITE_TEXT = re.compile(r"^\s*(?:website|visit site|visit website|web)\s*$", re.I)
+
+# One element per business. Deliberately NOT including span.OSrXXb: that span
+# is nested inside div.dbg0pd, so a combined selector counts 2+ per business
+# and makes the "have I widened to another business?" guard fire immediately.
+NAME_SEL = "div.dbg0pd"
+
+
+def _website_from_scope(scope) -> str:
+    """Best website URL found anywhere inside `scope`, most reliable first."""
+    anchors = scope.select("a[href]")
+    if not anchors:
+        return ""
+    # 1. The explicit "Website" button.
+    for a in anchors:
+        if WEBSITE_TEXT.match(a.get_text(" ", strip=True)):
+            u = _clean_url(a.get("href", ""))
+            if u:
+                return u
+    # 2. Google's click-tracking `ping` attribute carries the destination as
+    #    &url=..., and survives markup churn better than class names.
+    for a in anchors:
+        ping = a.get("ping", "")
+        if "url=" in ping:
+            qs = parse_qs(urlparse(ping).query)
+            if qs.get("url"):
+                u = _clean_url(unquote(qs["url"][0]))
+                if u:
+                    return u
+    # 3. Any absolute non-Google href.
+    for a in anchors:
+        u = _clean_url(a.get("href", ""))
+        if u:
+            return u
+    return ""
+
+
+def extract_website(block) -> str:
+    """Website URL for one business result.
+
+    The Website anchor frequently sits OUTSIDE the text container:
+    div.rllt__details holds the name, rating and address but ZERO anchors, and
+    the nearest anchor-bearing ancestor is six levels up. Searching only the
+    block therefore returned "" for most businesses -- which is what left 556
+    of 557 companies with no website, and no founder or type data either.
+
+    So walk upwards, stopping as soon as an ancestor covers more than one
+    business name, or we would inherit a neighbour's URL.
+    """
+    u = _website_from_scope(block)
+    if u:
+        return u
+    node = block
+    for _ in range(8):
+        node = node.parent if node is not None else None
+        if node is None or not getattr(node, "name", None):
+            break
+        if len(node.select(NAME_SEL)) > 1:
+            break  # widened to another business; abandon the walk
+        u = _website_from_scope(node)
+        if u:
+            return u
+    return ""
+
+
+def _outermost(blocks: list) -> list:
+    """Drop blocks nested inside another matched block.
+
+    Google nests uMdZh > VkpGBb > ... > rllt__details and ALL of them match the
+    selector list, so 20 businesses yield 60 blocks. Keeping only the outermost
+    gives one block per business and guarantees the anchor-bearing container
+    wins the name-based dedupe.
+    """
+    out = []
+    for b in blocks:
+        if not any(b is not o and o in b.parents for o in blocks):
+            out.append(b)
+    return out
+
+
 def parse_local_results(html: str) -> list[LocalResult]:
     """Extract businesses from a tbm=lcl page.
 
@@ -540,7 +640,10 @@ def parse_local_results(html: str) -> list[LocalResult]:
     seen: set[str] = set()
 
     # Strategy 1: containers carrying a business id.
-    blocks = soup.select("[data-cid], div.VkpGBb, div.uMdZh, div.rllt__details")
+    # Note: current markup has NO data-cid attributes at all; it is kept only
+    # for older layouts. _outermost collapses the uMdZh/VkpGBb/rllt__details
+    # nesting so each business is handled once.
+    blocks = _outermost(soup.select("[data-cid], div.VkpGBb, div.uMdZh, div.rllt__details"))
 
     # Strategy 2: if nothing matched, treat each local-title heading's
     # grandparent as a block.
@@ -608,11 +711,7 @@ def parse_local_results(html: str) -> list[LocalResult]:
                     item.category = probe
 
         # --- website / phone
-        for a in block.select("a[href]"):
-            url = _clean_url(a.get("href", ""))
-            if url:
-                item.website = url
-                break
+        item.website = extract_website(block)
         pm = PHONE_RE.search(text)
         if pm and len(re.sub(r"\D", "", pm.group(0))) >= 10:
             item.phone = pm.group(0).strip()
@@ -671,10 +770,10 @@ def parse_local_pack(html: str) -> list[LocalResult]:
     seen: set[str] = set()
 
     # The pack lives in a handful of containers depending on layout.
-    blocks = soup.select(
+    blocks = _outermost(soup.select(
         "div.VkpGBb, div.rllt__details, div.cXedhc, div.uMdZh, "
         "div[data-record-index], div.C8TUKc"
-    )
+    ))
     if not blocks:
         # Some layouts only expose headings; climb to a sensible ancestor.
         for t in soup.select("div.dbg0pd, span.OSrXXb"):
@@ -724,11 +823,7 @@ def parse_local_pack(html: str) -> list[LocalResult]:
                 if not RATING_ONLY.search(probe) and "review" not in probe.lower():
                     item.category = probe
 
-        for a in block.select("a[href]"):
-            u = _clean_url(a.get("href", ""))
-            if u:
-                item.website = u
-                break
+        item.website = extract_website(block)
 
         results.append(item)
 
