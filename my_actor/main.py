@@ -143,9 +143,13 @@ def _build_row(entry: dict, wd) -> dict:
     f_name, f_role, f_conf, f_note = entry.get("founder", ("", "", "not found", ""))
     e_val, e_conf, e_note = entry.get("employees", ("", "not found", ""))
 
-    if wd and wd.company_type:
+    if wd and wd.company_type and wd.company_type != "unknown":
         c_type, c_conf, c_evidence = wd.company_type, wd.type_confidence, wd.type_evidence
     else:
+        # classify.py returns "unknown" when the page gave it nothing. That is
+        # truthy, so it used to pass through as a real answer AND count as
+        # "filled" in the summary -- reporting type 557/557 on a run where the
+        # website crawl reached exactly one site.
         c_type, c_conf, c_evidence = "not found", "not found", ""
 
     notes = [n for n in (f_note, e_note) if n]
@@ -159,7 +163,11 @@ def _build_row(entry: dict, wd) -> dict:
         "category": entry.get("category", ""),
         "category_label": CATEGORY_LABELS.get(entry.get("category", ""), ""),
         "address": place.address or "not found",
-        "website_url": place.website or "not found",
+        # MUST be a real URL or an empty string. dataset_schema.json declares
+        # this column as format:"link", so the Console runs new URL(value) on
+        # it -- the placeholder "not found" made every cell render as
+        # "Failed to construct 'URL': Invalid URL".
+        "website_url": place.website or "",
         "rating": place.rating,
         "reviews": place.reviews,
         "owner_founder": f_name or "not found",
@@ -607,7 +615,9 @@ async def main() -> None:
         total_rows = pushed + len(rows_out)
         rows_out = [_build_row(e, website_data.get(e["place"].name)) for e in selected]
 
-        filled = lambda k: sum(1 for r in rows_out if r[k] not in ("", None, "not found"))
+        filled = lambda k: sum(
+            1 for r in rows_out if r[k] not in ("", None, "not found", "unknown")
+        )
         logger.info(
             "Done. %s rows saved | founder %s | employees %s | type %s",
             total_rows, filled("owner_founder"), filled("employees"), filled("company_type"),
