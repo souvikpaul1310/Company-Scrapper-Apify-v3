@@ -25,10 +25,10 @@ from apify import Actor, Event
 from .classify import classify_company_type
 from .people import extract_employees, extract_founder
 from .serp import LocalResult, SerpClient
+from .areas import KOLKATA_AREAS, discover_areas
 from .taxonomy import (
     CATEGORY_LABELS,
     DEFAULT_CATEGORIES,
-    KOLKATA_AREAS,
     categorise,
     resolve_category,
     search_terms_for,
@@ -216,12 +216,39 @@ async def main() -> None:
         # Area sweep. Google's local finder caps out near 100 results per
         # query, so running the same terms against each sub-area is the only
         # way to get past that ceiling towards full coverage.
+        # Area resolution, in priority order:
+        #   1. an explicit `areas` list  -- full control, any location
+        #   2. auto-discovery from OpenStreetMap -- works for any city
+        #   3. the built-in Kolkata list -- legacy fallback
+        #   4. the bare location -- one query set, plateaus near ~100 results
         areas = [a.strip() for a in (cfg.get("areas") or []) if a and a.strip()]
-        if not areas:
-            if cfg.get("useBuiltInAreas", False):
-                areas = list(KOLKATA_AREAS)
-            else:
-                areas = [location]
+        auto_areas = cfg.get("autoDiscoverAreas", True)
+        max_auto = max(1, int(cfg.get("maxAutoAreas") or 40))
+        if areas:
+            logger.info("Using %s areas supplied in the input.", len(areas))
+        elif auto_areas:
+            import aiohttp
+            async with aiohttp.ClientSession() as _s:
+                areas = await discover_areas(_s, location, limit=max_auto)
+            if not areas:
+                if cfg.get("useBuiltInAreas", False):
+                    areas = list(KOLKATA_AREAS)
+                    logger.warning(
+                        "Area auto-discovery found nothing; falling back to the "
+                        "built-in Kolkata list (%s areas).", len(areas)
+                    )
+                else:
+                    areas = [location]
+                    logger.warning(
+                        "Area auto-discovery found nothing for %r, so this run sweeps "
+                        "the location city-wide only. Google caps a single query near "
+                        "100 results, so expect a plateau -- supply an `areas` list to "
+                        "get past it.", location
+                    )
+        elif cfg.get("useBuiltInAreas", False):
+            areas = list(KOLKATA_AREAS)
+        else:
+            areas = [location]
 
         country = (cfg.get("countryCode") or "IN").upper()
         max_pages = max(1, int(cfg.get("maxLocalPagesPerTerm") or 3))
