@@ -24,6 +24,7 @@ usable rather than aborting the run.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from urllib.parse import quote
@@ -49,25 +50,43 @@ PLACE_RANKS = {
 }
 
 
-def build_overpass_query(city: str, radius_km: int = 25) -> str:
-    """Overpass QL listing place nodes in and around a named city.
+# Overpass charges by work done, and two things make a query expensive enough
+# to hit a 504 gateway timeout:
+#   * a REGEX on `place` -- Overpass cannot use its tag index for regex, so it
+#     scans every node in the area instead of looking them up
+#   * an over-broad area lookup
+# So each place kind gets its own exact-match statement, which is indexed.
+#
+# Also note `boundary=administrative`: the first version of this used
+# `boundary=admin`, which is not a real OSM tag value and matched nothing.
+QUERY_TIERS = (
+    # Tier 1: the useful place kinds inside the admin boundary.
+    ("suburb", "neighbourhood", "city_district", "quarter", "borough", "town"),
+    # Tier 2: cheapest possible -- just suburbs and neighbourhoods.
+    ("suburb", "neighbourhood"),
+)
 
-    Uses `area[name=...]` when the city is a mapped admin boundary, and falls
-    back to a radius around the city node, because plenty of places are mapped
-    as nodes without a boundary relation.
+
+def build_overpass_query(city: str, kinds: tuple[str, ...] | None = None,
+                         timeout: int = 90, limit: int = 300) -> str:
+    """Overpass QL listing place nodes inside a named city's admin boundary.
+
+    Uses one indexed exact-match statement per place kind rather than a single
+    regex, which is the difference between a fast lookup and a 504.
     """
     # Use only the first comma-segment: OSM boundaries are named "Kolkata",
     # not "Kolkata, India", so passing the full input string matches nothing.
     safe = city.split(",")[0].strip().replace('"', '\\"')
-    kinds = "|".join(PLACE_RANKS)
-    return f"""
-[out:json][timeout:60];
-(
-  area[name="{safe}"][boundary=admin]->.a;
-  node(area.a)[place~"^({kinds})$"];
-);
-out tags 400;
-""".strip()
+    kinds = kinds or QUERY_TIERS[0]
+    stmts = "\n".join(
+        f'  node["place"="{k}"](area.searchArea);' for k in kinds
+    )
+    return (
+        f"[out:json][timeout:{timeout}];\n"
+        f'area["name"="{safe}"]["boundary"="administrative"]->.searchArea;\n'
+        f"(\n{stmts}\n);\n"
+        f"out tags {limit};"
+    )
 
 
 def parse_overpass(payload: str | dict, city: str, limit: int = 40) -> list[str]:
@@ -116,11 +135,24 @@ def parse_overpass(payload: str | dict, city: str, limit: int = 40) -> list[str]
 
 
 async def discover_areas(
-    session, city: str, *, limit: int = 40, timeout: int = 60
+    session, city: str, *, limit: int = 40, timeout: int = 100
 ) -> list[str]:
-    """Fetch sub-areas for `city`. Returns [] on any failure."""
-    query = build_overpass_query(city)
+    """Fetch sub-areas for `city`. Returns [] on any failure.
+
+    Overpass is free and volunteer-run: 504 gateway timeouts are common and
+    usually mean "too expensive, try smaller" rather than "broken". So this
+    walks down QUERY_TIERS (progressively cheaper queries) across both
+    mirrors, with a short backoff between attempts.
+    """
+    attempts: list[tuple[str, tuple[str, ...], int, int]] = []
     for endpoint in OVERPASS_ENDPOINTS:
+        for tier_no, kinds in enumerate(QUERY_TIERS):
+            attempts.append((endpoint, kinds, 90 if tier_no == 0 else 45,
+                             300 if tier_no == 0 else 150))
+
+    last = ""
+    for i, (endpoint, kinds, qtimeout, qlimit) in enumerate(attempts, 1):
+        query = build_overpass_query(city, kinds, timeout=qtimeout, limit=qlimit)
         try:
             async with session.post(
                 endpoint,
@@ -132,12 +164,24 @@ async def discover_areas(
                 },
                 timeout=timeout,
             ) as resp:
+                if resp.status in (429, 504, 503):
+                    last = f"HTTP {resp.status}"
+                    logger.warning(
+                        "Overpass attempt %s/%s: %s from %s with %s place kinds "
+                        "(504 usually means the query was too heavy; retrying smaller)",
+                        i, len(attempts), last, endpoint.split("/")[2], len(kinds),
+                    )
+                    await asyncio.sleep(3 * i)
+                    continue
                 if resp.status != 200:
-                    logger.warning("Overpass %s returned HTTP %s", endpoint, resp.status)
+                    last = f"HTTP {resp.status}"
+                    logger.warning("Overpass attempt %s/%s: %s", i, len(attempts), last)
                     continue
                 body = await resp.text()
         except Exception as exc:
-            logger.warning("Overpass %s failed: %s", endpoint, exc)
+            last = f"{type(exc).__name__}: {exc or '(no message)'}"
+            logger.warning("Overpass attempt %s/%s failed -- %s", i, len(attempts), last)
+            await asyncio.sleep(2 * i)
             continue
 
         areas = parse_overpass(body, city, limit=limit)
@@ -148,7 +192,14 @@ async def discover_areas(
                 " ..." if len(areas) > 6 else "",
             )
             return areas
-        logger.warning("Overpass returned no usable places for %r", city)
+        last = "no usable places in response"
+        logger.warning("Overpass attempt %s/%s: %s", i, len(attempts), last)
+
+    logger.warning(
+        "Area auto-discovery failed after %s attempts (last: %s). Supply an "
+        "`areas` list in the input to sweep localities explicitly.",
+        len(attempts), last,
+    )
     return []
 
 
